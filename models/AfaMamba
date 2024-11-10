@@ -1,0 +1,478 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange, repeat
+
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+import timm
+from .MambaBlock import VSSBlock
+
+class ConvBNReLU(nn.Sequential):
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, stride=1, norm_layer=nn.BatchNorm2d, bias=False):
+        super(ConvBNReLU, self).__init__(
+            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, bias=bias,
+                      dilation=dilation, stride=stride, padding=((stride - 1) + dilation * (kernel_size - 1)) // 2),
+            norm_layer(out_channels),
+            nn.ReLU6()
+        )
+
+
+class ConvBN(nn.Sequential):
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, stride=1, norm_layer=nn.BatchNorm2d, bias=False):
+        super(ConvBN, self).__init__(
+            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, bias=bias,
+                      dilation=dilation, stride=stride, padding=((stride - 1) + dilation * (kernel_size - 1)) // 2),
+            norm_layer(out_channels)
+        )
+
+
+class Conv(nn.Sequential):
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, stride=1, bias=False):
+        super(Conv, self).__init__(
+            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, bias=bias,
+                      dilation=dilation, stride=stride, padding=((stride - 1) + dilation * (kernel_size - 1)) // 2)
+        )
+
+
+class SeparableConvBNReLU(nn.Sequential):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, dilation=1,
+                 norm_layer=nn.BatchNorm2d):
+        super(SeparableConvBNReLU, self).__init__(
+            nn.Conv2d(in_channels, in_channels, kernel_size, stride=stride, dilation=dilation,
+                      padding=((stride - 1) + dilation * (kernel_size - 1)) // 2,
+                      groups=in_channels, bias=False),
+            norm_layer(out_channels),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.ReLU6()
+        )
+
+
+class SeparableConvBN(nn.Sequential):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, dilation=1,
+                 norm_layer=nn.BatchNorm2d):
+        super(SeparableConvBN, self).__init__(
+            nn.Conv2d(in_channels, in_channels, kernel_size, stride=stride, dilation=dilation,
+                      padding=((stride - 1) + dilation * (kernel_size - 1)) // 2,
+                      groups=in_channels, bias=False),
+            norm_layer(out_channels),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        )
+
+
+class SeparableConv(nn.Sequential):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, dilation=1):
+        super(SeparableConv, self).__init__(
+            nn.Conv2d(in_channels, in_channels, kernel_size, stride=stride, dilation=dilation,
+                      padding=((stride - 1) + dilation * (kernel_size - 1)) // 2,
+                      groups=in_channels, bias=False),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        )
+
+
+class WF_CAT(nn.Module):
+    def __init__(self, in_channels=128, decode_channels=128, eps=1e-8):
+        super(WF_CAT, self).__init__()
+        self.pre_conv = Conv(in_channels, decode_channels, kernel_size=1)
+
+        self.weights = nn.Parameter(torch.ones(2, dtype=torch.float32), requires_grad=True)
+        self.eps = eps
+        self.post_conv = ConvBNReLU(decode_channels, decode_channels, kernel_size=3)
+
+    def forward(self, x, res):
+        # x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        weights = nn.ReLU()(self.weights)
+        fuse_weights = weights / (torch.sum(weights, dim=0) + self.eps)
+        res = fuse_weights[0] * res
+        x = fuse_weights[1] * x
+        x = torch.cat((res, x),1)
+        x = self.pre_conv(x)
+        x = self.post_conv(x)
+        return x
+    
+class WF_SUM(nn.Module):
+    def __init__(self, in_channels=128, decode_channels=128, eps=1e-8):
+        super(WF_SUM, self).__init__()
+        self.pre_conv = Conv(in_channels, decode_channels, kernel_size=1)
+
+        self.weights = nn.Parameter(torch.ones(2, dtype=torch.float32), requires_grad=True)
+        self.eps = eps
+        self.post_conv = ConvBNReLU(decode_channels, decode_channels, kernel_size=3)
+
+    def forward(self, x, res):
+        # x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        weights = nn.ReLU()(self.weights)
+        fuse_weights = weights / (torch.sum(weights, dim=0) + self.eps)
+        x = fuse_weights[0] * self.pre_conv(res) + fuse_weights[1] * x
+        x = self.post_conv(x)
+        return x
+
+class BasicConv2d(nn.Module):
+    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1):
+        super(BasicConv2d, self).__init__()
+        self.conv = nn.Conv2d(in_planes, out_planes,
+                              kernel_size=kernel_size, stride=stride,
+                              padding=padding, dilation=dilation, bias=False)
+        self.bn = nn.BatchNorm2d(out_planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.init_weight()
+        
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        return x
+    
+    def init_weight(self):
+        for m in self.children():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, a=1)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+class Reduction(nn.Module):
+    def __init__(self, in_channel, out_channel):
+        super(Reduction, self).__init__()
+        self.reduce = nn.Sequential(
+            BasicConv2d(in_channel, out_channel, 1),
+            BasicConv2d(out_channel, out_channel, kernel_size=(1, 3), padding=(0, 1)),
+            BasicConv2d(out_channel, out_channel, kernel_size=(3, 1), padding=(1, 0)),
+            BasicConv2d(out_channel, out_channel, 3, padding=1),
+        )
+
+    def forward(self, x):
+        return self.reduce(x)
+
+class Cnn_stem(nn.Module):
+    
+    def __init__(self, in_channel, out_channel):
+        super(Cnn_stem, self).__init__()
+        self.stem = nn.Sequential(
+            BasicConv2d(in_channel, out_channel, kernel_size=3, stride=2, padding=1),
+            BasicConv2d(out_channel, out_channel, kernel_size=3, stride=1, padding=1),
+            BasicConv2d(out_channel, out_channel, kernel_size=3, stride=1, padding=1),
+            BasicConv2d(out_channel, out_channel, kernel_size=1, stride=1)
+        )
+        
+    def forward(self, x):
+        return self.stem(x)
+
+class AuxHead(nn.Module):
+
+    def __init__(self, in_channels=64, num_classes=6):
+        super().__init__()
+        self.conv = ConvBNReLU(in_channels, in_channels)
+        self.drop = nn.Dropout(0.1)
+        self.conv_out = Conv(in_channels, num_classes, kernel_size=1)
+
+    def forward(self, x, h, w):
+        feat = self.conv(x)
+        feat = self.drop(feat)
+        feat = self.conv_out(x)
+        feat = F.interpolate(feat, size=(h, w), mode='bilinear', align_corners=False)
+        return feat
+    
+
+                    
+def add_conv(in_ch, out_ch, ksize, stride, leaky=False):
+    """
+    Add a conv2d / batchnorm / leaky ReLU block.
+    Args:
+        in_ch (int): number of input channels of the convolution layer.
+        out_ch (int): number of output channels of the convolution layer.
+        ksize (int): kernel size of the convolution layer.
+        stride (int): stride of the convolution layer.
+    Returns:
+        stage (Sequential) : Sequential layers composing a convolution block.
+    """
+    stage = nn.Sequential()
+    pad = (ksize - 1) // 2
+    stage.add_module('conv', nn.Conv2d(in_channels=in_ch,
+                                       out_channels=out_ch, kernel_size=ksize, stride=stride,
+                                       padding=pad, bias=False))
+    stage.add_module('batch_norm', nn.BatchNorm2d(out_ch))
+    if leaky:
+        stage.add_module('leaky', nn.LeakyReLU(0.1))
+    else:
+        stage.add_module('relu6', nn.ReLU6(inplace=True))
+    return stage 
+                    
+class ASFF(nn.Module):
+    """
+     多尺度特征进行自适应融合
+    """
+    def __init__(self, level, rfb=False, vis=False):
+        super(ASFF, self).__init__()
+        self.level = level
+        if level==0:
+            self.stride_level_1 = add_conv(64, 64, 3, 2)
+            self.stride_level_2 = add_conv(64, 64, 3, 2)
+            self.stride_level_2_2 = add_conv(64, 64, 3, 2)
+            self.stride_level_3_1 = add_conv(64, 64, 3, 2)
+            self.stride_level_3_2 = add_conv(64, 64, 3, 2)
+            self.expand = add_conv(64, 64, 3, 1)
+        elif level==1:
+            # self.compress_level_0 = add_conv(64, 64, 1, 1)
+            self.stride_level_2 = add_conv(64, 64, 3, 2)
+            self.stride_level_3 = add_conv(64, 64, 3, 2)
+            self.expand = add_conv(64, 64, 3, 1)
+        elif level==2:
+            # self.compress_level_0 = add_conv(64, 64, 1, 1)
+            self.stride_level_3 = add_conv(64, 64, 3, 2)
+            self.expand = add_conv(64, 64, 3, 1)
+        elif level==3:
+            self.expand = add_conv(64, 64, 3, 1)
+
+        compress_c = 16 if rfb else 16  #when adding rfb, we use half number of channels to save memory
+
+        self.weight_level_0 = add_conv(64, compress_c, 1, 1)
+        self.weight_level_1 = add_conv(64, compress_c, 1, 1)
+        self.weight_level_2 = add_conv(64, compress_c, 1, 1)
+        self.weight_level_3 = add_conv(64, compress_c, 1, 1)
+
+        self.weight_levels = nn.Conv2d(compress_c*4, 4, kernel_size=1, stride=1, padding=0)
+        self.vis= vis
+
+
+    def forward(self, x_level_0, x_level_1, x_level_2, x_level_3):
+        if self.level==0:   #1/32 最小尺度
+            level_0_resized = x_level_0
+            level_1_resized = self.stride_level_1(x_level_1)
+            level_2_downsampled_inter =F.max_pool2d(x_level_2, 3, stride=2, padding=1)
+            level_2_resized = self.stride_level_2(level_2_downsampled_inter)
+            level_3_downsampled_inter =F.max_pool2d(x_level_3, 3, stride=2, padding=1)
+            level_3_resized_1 = self.stride_level_3_1(level_3_downsampled_inter)
+            level_3_resized = self.stride_level_3_2(level_3_resized_1)
+
+        elif self.level==1:  #1/16 尺度
+            # level_0_compressed = self.compress_level_0(x_level_0)
+            level_0_resized =F.interpolate(x_level_0, scale_factor=2, mode='nearest')
+            level_1_resized =x_level_1
+            level_2_resized =self.stride_level_2(x_level_2)
+            level_3_downsampled_inter =F.max_pool2d(x_level_3, 3, stride=2, padding=1)
+            level_3_resized = self.stride_level_3(level_3_downsampled_inter)
+            
+        elif self.level==2:   #1/8 最小尺度
+            # level_0_compressed = self.compress_level_0(x_level_0)
+            level_0_resized =F.interpolate(x_level_0, scale_factor=4, mode='nearest')
+            level_1_resized =F.interpolate(x_level_1, scale_factor=2, mode='nearest')
+            level_2_resized =x_level_2
+            level_3_resized = self.stride_level_3(x_level_3)
+            
+        elif self.level==3:
+            # level_0_compressed = self.compress_level_0(x_level_0)
+            level_0_resized = F.interpolate(x_level_0, scale_factor=8, mode='nearest')
+            level_1_resized = F.interpolate(x_level_1, scale_factor=4, mode='nearest')
+            level_2_resized = F.interpolate(x_level_2, scale_factor=2, mode='nearest')
+            level_3_resized = x_level_3
+
+        level_0_weight_v = self.weight_level_0(level_0_resized)
+        level_1_weight_v = self.weight_level_1(level_1_resized)
+        level_2_weight_v = self.weight_level_2(level_2_resized)
+        level_3_weight_v = self.weight_level_3(level_3_resized)
+        
+        levels_weight_v = torch.cat((level_0_weight_v, level_1_weight_v, level_2_weight_v, level_3_weight_v),1)
+        levels_weight = self.weight_levels(levels_weight_v)
+        levels_weight = F.softmax(levels_weight, dim=1)
+
+        fused_out_reduced = level_0_resized * levels_weight[:,0:1,:,:]+\
+                            level_1_resized * levels_weight[:,1:2,:,:]+\
+                            level_2_resized * levels_weight[:,2:3,:,:]+\
+                            level_3_resized * levels_weight[:,3:,:,:]
+
+        out = self.expand(fused_out_reduced)
+
+        if self.vis:
+            return out, levels_weight, fused_out_reduced.sum(dim=1)
+        else:
+            return out
+        
+        
+
+        
+        
+class Decoder(nn.Module):
+    def __init__(self,
+                 encoder_channels=(64, 128, 256, 512),
+                 decode_channels=64,
+                 dropout=0.1,
+                 num_classes=6):
+        super(Decoder, self).__init__()
+        
+        self.cnn_stem = Cnn_stem(3,decode_channels)
+        
+        self.reduce_sal1 = Reduction(encoder_channels[-4], decode_channels)
+        self.reduce_sal2 = Reduction(encoder_channels[-3], decode_channels)
+        self.reduce_sal3 = Reduction(encoder_channels[-2], decode_channels)
+        self.reduce_sal4 = Reduction(encoder_channels[-1], decode_channels)
+        
+        
+        self.GS_1 = VSSBlock(hidden_dim=64, drop_path=0.1, attn_drop_rate=0.1, d_state=16, expand=2.0, is_light_sr=False)
+        self.GS_2 = VSSBlock(hidden_dim=64, drop_path=0.1, attn_drop_rate=0.1, d_state=16, expand=2.0, is_light_sr=False)
+        self.GS_3 = VSSBlock(hidden_dim=64, drop_path=0.1, attn_drop_rate=0.1, d_state=16, expand=2.0, is_light_sr=False)
+        self.GS_4 = VSSBlock(hidden_dim=64, drop_path=0.1, attn_drop_rate=0.1, d_state=16, expand=2.0, is_light_sr=False)
+        
+        self.ASFF_0 = ASFF(level=0)
+        self.ASFF_1 = ASFF(level=1)
+        self.ASFF_2 = ASFF(level=2)
+        self.ASFF_3 = ASFF(level=3)
+        
+
+
+        self.S1 = nn.Sequential(
+            BasicConv2d(decode_channels, decode_channels, 3, padding=1),
+            nn.Conv2d(decode_channels, decode_channels, 1)
+        )
+        self.S2 = nn.Sequential(
+            BasicConv2d(decode_channels, decode_channels, 3, padding=1),
+            nn.Conv2d(decode_channels, decode_channels, 1)
+        )
+        self.S3 = nn.Sequential(
+            BasicConv2d(decode_channels, decode_channels, 3, padding=1),
+            nn.Conv2d(decode_channels, decode_channels, 1)
+        )
+        self.S4 = nn.Sequential(
+            BasicConv2d(decode_channels, decode_channels, 3, padding=1),
+            nn.Conv2d(decode_channels, decode_channels, 1)
+        )
+        
+        self.wf2 = WF_CAT(2 * decode_channels,decode_channels)
+        self.wf3 = WF_CAT(2 * decode_channels,decode_channels)
+        self.wf4 = WF_CAT(2 * decode_channels,decode_channels)
+        self.wf5 = WF_SUM(decode_channels,decode_channels)
+        
+
+        self.sigmoid = nn.Sigmoid()
+
+        if self.training:
+            self.aux_head1 = AuxHead(decode_channels, num_classes)
+            self.aux_head2 = AuxHead(decode_channels, num_classes)
+            self.aux_head3 = AuxHead(decode_channels, num_classes)
+            self.aux_head4 = AuxHead(decode_channels, num_classes)
+
+
+
+        self.segmentation_head = nn.Sequential(ConvBNReLU(decode_channels, decode_channels),
+                                               nn.Dropout2d(p=dropout, inplace=True),
+                                               Conv(decode_channels, num_classes, kernel_size=1))
+        self.init_weight()
+
+    def forward(self, x, res1, res2, res3, res4, h, w):
+       
+        #cnn stem 1/2大小
+        cnn_stem = self.cnn_stem(x)
+        
+        
+        #语义特征分支
+        x_sal1 = self.reduce_sal1(res1)      
+        x_sal2 = self.reduce_sal2(res2)
+        x_sal3 = self.reduce_sal3(res3)
+        x_sal4 = self.reduce_sal4(res4)
+        
+        # multiscale features adaptive fusion 
+        df_0 = self.ASFF_0(x_sal4,x_sal3,x_sal2,x_sal1)
+        df_1 = self.ASFF_1(x_sal4,x_sal3,x_sal2,x_sal1)
+        df_2 = self.ASFF_2(x_sal4,x_sal3,x_sal2,x_sal1)
+        df_3 = self.ASFF_3(x_sal4,x_sal3,x_sal2,x_sal1)
+        
+        #1/32尺度的输出
+        x_out4 = self.GS_1(df_0)
+        
+        #上采样2倍
+        sal4_3 = F.interpolate(x_out4, size=x_sal3.size()[2:], mode='bilinear')
+        #Cat信息融合
+        sal3 = self.wf2(sal4_3, df_1)
+        
+        #1/16尺度的输出
+        x_out3 = self.GS_2(sal3)
+
+        #上采样2倍
+        sal3_2 = F.interpolate(x_out3, size=x_sal2.size()[2:], mode='bilinear')
+     
+        sal2 = self.wf3(sal3_2, df_2)
+        #1/8尺度的输出
+        x_out2 = self.GS_3(sal2)
+        
+        #上采样2倍
+        sal2_1 = F.interpolate(x_out2, size=x_sal1.size()[2:], mode='bilinear')
+        sal1 = self.wf4(sal2_1, df_3)
+        #1/4的输出
+        x_out1 = self.GS_4(sal1)
+
+        #1/2的输出
+        x_out = F.interpolate(x_out1, size=cnn_stem.size()[2:], mode='bilinear')
+        x_out = self.wf5(x_out, cnn_stem)
+
+        x = self.segmentation_head(x_out)
+        x = F.interpolate(x, size=(h, w), mode='bilinear', align_corners=True)
+        if self.training:
+            sal1 = self.S1(x_out1)
+            sal2 = self.S2(x_out2)
+            sal3 = self.S3(x_out3)
+            sal4 = self.S4(x_out4)
+            sal1 = self.aux_head1(sal1,h,w)
+            sal2 = self.aux_head2(sal2,h,w)
+            sal3 = self.aux_head3(sal3,h,w)
+            sal4 = self.aux_head4(sal4,h,w)
+
+            return x, sal1, sal2, sal3, sal4
+        else:
+            return x
+
+    def init_weight(self):
+        for m in self.children():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, a=1)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+
+from timm.models.efficientnet import _cfg
+
+class AFA(nn.Module):
+    def __init__(self,
+                 decode_channels=64,
+                 dropout=0.1,
+                 backbone_name='swsl_resnet18',
+                 pretrained=True,
+                 num_classes=6
+                 ):
+        super().__init__()
+
+        config = _cfg(url='', file='pretrain_weights/semi_weakly_supervised_resnet18.pth')
+
+        self.backbone = timm.create_model(backbone_name, features_only=True, output_stride=32,
+                        out_indices=(1, 2, 3, 4), pretrained=pretrained,pretrained_cfg=config)
+
+        encoder_channels = self.backbone.feature_info.channels()
+
+        self.decoder = Decoder(encoder_channels, decode_channels, dropout, num_classes)
+
+    def forward(self, x):
+        h, w = x.size()[-2:]
+
+        res1, res2, res3, res4 = self.backbone(x)
+        # print(res1.size(),res2.size(),res3.size(),res4.size())
+        #torch.Size([8, 64, 256, 256]) torch.Size([8, 128, 128, 128]) #1/4;  1/8
+        #torch.Size([8, 256, 64, 64]) torch.Size([8, 512, 32, 32])  #1/16;  1/32
+        if self.training:
+            x, s1, s2, s3, s4 = self.decoder(x,res1, res2, res3, res4, h, w)
+            return x, s1, s2, s3, s4
+        else:
+            x = self.decoder(x,res1, res2, res3, res4, h, w)
+            return x
+
+
+from thop import profile
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = AFA(num_classes=6)
+    model = model.to(device)
+    input = torch.randn(1, 3, 512, 512).to(device)
+    Flops, params = profile(model, inputs=(input,)) # macs
+    print('Flops: % .4fG'%(Flops / 1000000000))# 计算量
+    print('params参数量: % .4fM'% (params / 1000000)) #参数量：等价与上面的summary输出的Total params值
+
+
+#512×512  AfaMamba
+# Flops:  28.0397G
+# params参数量:  13.0141M
